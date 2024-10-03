@@ -58,6 +58,4 @@ This project demonstrates how to use an **ESP32** microcontroller to communicate
 - **Authentication**: The ESP32 authenticates a client by checking the received Bluetooth message against the predefined `secretKey`.
 - **Sensor Data Transmission**: After authentication, the ESP32 sends accelerometer and gyroscope data from the MPU-6050 to the Flutter app every second. The blue LED blinks to indicate data transmission.
 
-## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
