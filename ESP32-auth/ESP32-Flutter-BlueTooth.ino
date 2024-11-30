@@ -1,132 +1,333 @@
-#include <BluetoothSerial.h>
+/*
+    Based on Neil Kolban example for IDF: https://github.com/nkolban/esp32-snippets/blob/master/cpp_utils/tests/BLE%20Tests/SampleServer.cpp
+    Ported to Arduino ESP32 by Evandro Copercini
+    updates by chegewara
+*/
+
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+#include <BLE2902.h>
+
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include <Wire.h>
 
-BluetoothSerial SerialBT;
 Adafruit_MPU6050 mpu;
 
-// Pin definitions for the LEDs
-const int redGreenLED = 14;  // Combined Red/Green LED for MPU initialization (D14)
-const int greenLED = 27;     // Green LED for Authorization (D27)
-const int redLED2 = 26;      // Red LED for Bluetooth connection (D26)
-const int blueLED = 25;      // Blue LED for Data transmission (D25)
+// See the following for generating UUIDs:
+// https://www.uuidgenerator.net/
+static BLEUUID BLE_DATA_SERVICE_UUID           ("82afce6c-9638-493b-9be0-d2aebc45f5af");
+static BLEUUID BLE_AUTH_SERVICE_UUID           ("b7037e40-4dbe-4e49-9652-c5d11a0e7bbf");
 
-const String secretKey = "MY_SECRET_KEY"; // Shared key between ESP32 and Flutter app
-bool isAuthenticated = false; // Authentication status
-String receivedMessage = "";
+#define CHARACTERISTIC_AUTH_WRITE_UUID          "c8744281-4e46-4b49-99c2-4a1d0a4ad2a4"
 
-// Function to get MPU-6050 sensor readings
-void getMPUData(float &accX, float &accY, float &accZ, float &gyroX, float &gyroY, float &gyroZ) {
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
+#define CHARACTERISTIC_LED_UUID                 "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 
-  // Store accelerometer data
-  accX = a.acceleration.x;
-  accY = a.acceleration.y;
-  accZ = a.acceleration.z;
+#define CHARACTERISTIC_ACCEL_X_UUID             "dc2ddfce-07a1-4cd9-b53a-0c9461dd2e4d"
+#define CHARACTERISTIC_ACCEL_Y_UUID             "2434c5cd-9af9-4c20-9f6c-ed569283adb5"
+#define CHARACTERISTIC_ACCEL_Z_UUID             "442f145b-195d-4c97-b601-731700c36aa5"
 
-  // Store gyroscope data
-  gyroX = g.gyro.x;
-  gyroY = g.gyro.y;
-  gyroZ = g.gyro.z;
+#define CHARACTERISTIC_GYRO_X_UUID              "4c77c0a5-dbd2-44fd-8a8a-655fa880039b"
+#define CHARACTERISTIC_GYRO_Y_UUID              "4dda858f-1ee8-49f4-b7a3-b4fba86fab5a"
+#define CHARACTERISTIC_GYRO_Z_UUID              "9186d23f-cd46-476c-bdcc-cba3536cc490"
+
+
+// MUST be a 6-digit number, no more, no less
+const uint32_t PASSWORD = 696969;
+
+
+const uint8_t POWER_PIN = 14;
+const uint8_t MPU_VCC_PIN = 26;
+const uint8_t MPU_GND_PIN = 25;
+const uint8_t MPU_SCL_PIN = 33;
+const uint8_t MPU_SDA_PIN = 32;
+
+BLECharacteristic *pcharacteristicAuthWrite;
+
+BLECharacteristic *pcharacteristicLED;
+
+BLEServer *pServer;
+
+struct characteristicAccelStruct {
+  BLECharacteristic *X = nullptr;
+  BLECharacteristic *Y = nullptr;
+  BLECharacteristic *Z = nullptr;
+};
+
+characteristicAccelStruct characteristicAccel;
+
+struct characteristicGyroStruct {
+  BLECharacteristic *X = nullptr;
+  BLECharacteristic *Y = nullptr;
+  BLECharacteristic *Z = nullptr;
+};
+
+characteristicAccelStruct characteristicGyro;
+
+bool device_connected = false;
+bool mpu_connected = false;
+
+
+class ServerCallBacks : public BLEServerCallbacks {
+  
+  void onConnect(BLEServer *pServer) {
+    Serial.println("connected to someone");
+    if (!pServer->getPeerDevices(true).size()) {  // Check if paired
+        Serial.println("Peer device not paired. Disconnecting...");
+        pServer->disconnect(0);  // Disconnect if not paired
+    }
+    device_connected = true;
+  }
+  void onDisconnect(BLEServer *pServer) {
+    device_connected = false;
+    Serial.println("disconnected from someone");
+    pServer->getAdvertising()->start();
+  }
+};
+
+
+void IRAM_ATTR ToggleDeepSleep() {
+  static int64_t lMillis = 0;
+
+  if((millis() - lMillis) < 5) return;
+
+  lMillis = millis();
+  disableInterrupt(POWER_PIN);
+  
+  Serial.println("going to sleep...");
+  detachInterrupt(POWER_PIN);
+  attachInterrupt(POWER_PIN, power_down, FALLING);
 }
+
+void power_down() {
+  Serial.println("now can enable again");
+  detachInterrupt(POWER_PIN);
+  esp_sleep_enable_ext0_wakeup(gpio_num_t(POWER_PIN), RISING);
+  esp_deep_sleep_start();
+}
+
+
+
+
+
+void init_BLEDataService() {
+  BLEService *pDataService = pServer->createService(BLE_DATA_SERVICE_UUID, 30, 0);
+
+  pcharacteristicLED    = pDataService->createCharacteristic(CHARACTERISTIC_LED_UUID, BLECharacteristic::PROPERTY_WRITE);
+
+  characteristicAccel.X = pDataService->createCharacteristic(CHARACTERISTIC_ACCEL_X_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  characteristicAccel.X->setAccessPermissions(ESP_GATT_PERM_READ_ENCRYPTED | ESP_GATT_PERM_WRITE_ENCRYPTED);
+  characteristicAccel.Y = pDataService->createCharacteristic(CHARACTERISTIC_ACCEL_Y_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  characteristicAccel.Y->setAccessPermissions(ESP_GATT_PERM_READ_ENCRYPTED | ESP_GATT_PERM_WRITE_ENCRYPTED);
+  characteristicAccel.Z = pDataService->createCharacteristic(CHARACTERISTIC_ACCEL_Z_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  characteristicAccel.Z->setAccessPermissions(ESP_GATT_PERM_READ_ENCRYPTED | ESP_GATT_PERM_WRITE_ENCRYPTED);
+
+  characteristicGyro.X  = pDataService->createCharacteristic(CHARACTERISTIC_GYRO_X_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  characteristicGyro.X->setAccessPermissions(ESP_GATT_PERM_READ_ENCRYPTED | ESP_GATT_PERM_WRITE_ENCRYPTED);
+  characteristicGyro.Y  = pDataService->createCharacteristic(CHARACTERISTIC_GYRO_Y_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  characteristicGyro.Y->setAccessPermissions(ESP_GATT_PERM_READ_ENCRYPTED | ESP_GATT_PERM_WRITE_ENCRYPTED);
+  characteristicGyro.Z  = pDataService->createCharacteristic(CHARACTERISTIC_GYRO_Z_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  characteristicGyro.Z->setAccessPermissions(ESP_GATT_PERM_READ_ENCRYPTED | ESP_GATT_PERM_WRITE_ENCRYPTED);
+
+
+  BLEDescriptor *pDesciptorAccelX = new BLEDescriptor((uint16_t) 0x2901);
+  pDesciptorAccelX->setValue("Acceleration X Axis");
+  BLEDescriptor *pDesciptorAccelY = new BLEDescriptor((uint16_t) 0x2901);
+  pDesciptorAccelY->setValue("Acceleration Y Axis");
+  BLEDescriptor *pDesciptorAccelZ = new BLEDescriptor((uint16_t) 0x2901);
+  pDesciptorAccelZ->setValue("Acceleration Z Axis");
+
+  BLEDescriptor *pDesciptorGyroX = new BLEDescriptor((uint16_t) 0x2901);
+  pDesciptorGyroX->setValue("Gyro X Axis");
+  BLEDescriptor *pDesciptorGyroY = new BLEDescriptor((uint16_t) 0x2901);
+  pDesciptorGyroY->setValue("Gyro Y Axis");
+  BLEDescriptor *pDesciptorGyroZ = new BLEDescriptor((uint16_t) 0x2901);
+  pDesciptorGyroZ->setValue("Gyro Z Axis");
+
+  (characteristicAccel.X)->addDescriptor(pDesciptorAccelX);
+  (characteristicAccel.Y)->addDescriptor(pDesciptorAccelY);
+  (characteristicAccel.Z)->addDescriptor(pDesciptorAccelZ);
+
+  (characteristicGyro.X)->addDescriptor(pDesciptorGyroX);
+  (characteristicGyro.Y)->addDescriptor(pDesciptorGyroY);
+  (characteristicGyro.Z)->addDescriptor(pDesciptorGyroZ);
+
+
+
+  pDataService->start();
+
+}
+
+void init_BLE() {
+    BLEDevice::init("FlexiScan");
+
+    pServer = BLEDevice::createServer();
+    pServer->setCallbacks(new ServerCallBacks());
+
+    // Security setup
+    BLESecurity *pSecurity = new BLESecurity();
+    pSecurity->setAuthenticationMode(ESP_LE_AUTH_BOND); // Enforce bonding and pairing
+    pSecurity->setCapability(ESP_IO_CAP_OUT);           // Display output capability
+    pSecurity->setStaticPIN(PASSWORD);                  // Set static PIN
+    pSecurity->setKeySize(16);                          // Ensure 128-bit key size
+    pSecurity->setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
+
+    init_BLEDataService();
+
+    pServer->getAdvertising()->start();
+
+    Serial.println("Began advertising with secure connection");
+}
+
+void init_MPU6050() {
+
+  // pinMode(MPU_VCC_PIN, OUTPUT);
+  // pinMode(MPU_GND_PIN, OUTPUT);
+
+  // digitalWrite(MPU_VCC_PIN, HIGH);
+  // digitalWrite(MPU_GND_PIN, LOW);
+
+  // if(!Wire.setPins(MPU_SDA_PIN, MPU_SCL_PIN)) {
+  //   return;
+  // }
+
+  // delay(100);
+
+  // if (!mpu.begin()) {
+  //   Serial.println("Failed to find MPU6050 chip");
+  //   mpu_connected = false;
+  //   return;
+  // } else {
+  //   Serial.println("MPU6050 Found!");
+  //   mpu_connected = true;
+  // }
+
+  // mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
+  // Serial.print("Accelerometer range set to: ");
+  // switch (mpu.getAccelerometerRange()) {
+  // case MPU6050_RANGE_2_G:
+  //   Serial.println("+-2G");
+  //   break;
+  // case MPU6050_RANGE_4_G:
+  //   Serial.println("+-4G");
+  //   break;
+  // case MPU6050_RANGE_8_G:
+  //   Serial.println("+-8G");
+  //   break;
+  // case MPU6050_RANGE_16_G:
+  //   Serial.println("+-16G");
+  //   break;
+  // }
+  // mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  // Serial.print("Gyro range set to: ");
+  // switch (mpu.getGyroRange()) {
+  // case MPU6050_RANGE_250_DEG:
+  //   Serial.println("+- 250 deg/s");
+  //   break;
+  // case MPU6050_RANGE_500_DEG:
+  //   Serial.println("+- 500 deg/s");
+  //   break;
+  // case MPU6050_RANGE_1000_DEG:
+  //   Serial.println("+- 1000 deg/s");
+  //   break;
+  // case MPU6050_RANGE_2000_DEG:
+  //   Serial.println("+- 2000 deg/s");
+  //   break;
+  // }
+
+  // mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  // Serial.print("Filter bandwidth set to: ");
+  // switch (mpu.getFilterBandwidth()) {
+  // case MPU6050_BAND_260_HZ:
+  //   Serial.println("260 Hz");
+  //   break;
+  // case MPU6050_BAND_184_HZ:
+  //   Serial.println("184 Hz");
+  //   break;
+  // case MPU6050_BAND_94_HZ:
+  //   Serial.println("94 Hz");
+  //   break;
+  // case MPU6050_BAND_44_HZ:
+  //   Serial.println("44 Hz");
+  //   break;
+  // case MPU6050_BAND_21_HZ:
+  //   Serial.println("21 Hz");
+  //   break;
+  // case MPU6050_BAND_10_HZ:
+  //   Serial.println("10 Hz");
+  //   break;
+  // case MPU6050_BAND_5_HZ:
+  //   Serial.println("5 Hz");
+  //   break;
+  // }
+  mpu_connected = true;
+}
+
+
+
+
+
 
 void setup() {
   Serial.begin(115200);
+  Serial.println("Starting BLE work!");
+  //esp_sleep_enable_ext0_wakeup((gpio_num_t) 14, HIGH);
+  
+  attachInterrupt(POWER_PIN, ToggleDeepSleep, HIGH);
+  //esp_deep_sleep_start();
+  BLEDevice::deinit(false);
+  init_BLE();
+  init_MPU6050();
 
-  // Initialize LED pins
-  pinMode(redGreenLED, OUTPUT);
-  pinMode(greenLED, OUTPUT);
-  pinMode(redLED2, OUTPUT);
-  pinMode(blueLED, OUTPUT);
 
-  // Initialize Bluetooth
-  if (!SerialBT.begin("FlexiScan Device")) {
-    Serial.println("Error initializing Bluetooth");
-    digitalWrite(redLED2, HIGH); // Turn on Red LED2 to indicate Bluetooth initialization error
-    ESP.restart();
-  } else {
-    Serial.println("Bluetooth Initialized");
-  }
-
-  SerialBT.register_callback(btCallBack);
-  Serial.println("The device is ready to connect!");
-
-  // Initialize MPU6050
-  if (!mpu.begin()) {
-    Serial.println("Failed to initialize MPU6050. Check your connections!");
-    while (1);
-  }
-  Serial.println("MPU6050 Initialized");
-  digitalWrite(redGreenLED, LOW);   // Ensure Red is OFF
-  digitalWrite(redGreenLED, HIGH);  // Turn on Green LED for successful MPU initialization
 }
 
-void btCallBack(esp_spp_cb_event_t event, esp_spp_cb_param_t *param) {
-  if (event == ESP_SPP_SRV_OPEN_EVT) {
-    Serial.println("Client Connected");
-    digitalWrite(redLED2, HIGH); // Turn on Red LED2 when a device is connected
-    isAuthenticated = false;    // Reset authentication status on new connection
-    digitalWrite(greenLED, LOW); // Turn off Green LED (D27) for new connection
-  } else if (event == ESP_SPP_CLOSE_EVT) {
-    Serial.println("Client Disconnected");
-    digitalWrite(redLED2, LOW);  // Turn off Red LED2 when a device is disconnected
-    isAuthenticated = false;    // Reset authentication status on disconnection
-    digitalWrite(greenLED, LOW); // Turn off Green LED when disconnected
-  }
-}
 
 void loop() {
-  if (SerialBT.available()) {
-    receivedMessage = SerialBT.readString();  // Read incoming message
-    Serial.print("Received message: ");
-    Serial.println(receivedMessage);
+  // Simulated sensor data
+  double accelX = random(-1000, 1000) / 100.0; // Random values between -10.00 and 10.00
+  double accelY = random(-1000, 1000) / 100.0;
+  double accelZ = random(-1000, 1000) / 100.0;
 
-    // Authentication handling
-    if (!isAuthenticated) {
-      // Blink Green LED (D27) during authentication
-      digitalWrite(greenLED, HIGH);  
-      delay(300);
-      digitalWrite(greenLED, LOW);
-      delay(300);
+  double gyroX = random(-500, 500) / 100.0; // Random values between -5.00 and 5.00
+  double gyroY = random(-500, 500) / 100.0;
+  double gyroZ = random(-500, 500) / 100.0;
 
-      if (receivedMessage == secretKey) {
-        isAuthenticated = true;
-        Serial.println("Authenticated successfully!");
-        digitalWrite(greenLED, HIGH);  // Keep Green LED ON when authenticated
-        SerialBT.println("Authentication successful");
-      } else {
-        Serial.println("Authentication failed! Disconnecting...");
-        SerialBT.println("Authentication failed");
-        SerialBT.disconnect();
-        digitalWrite(greenLED, LOW);  // Turn OFF Green LED if authentication fails
-      }
-    }
+  if (device_connected) {
+    char tx_string[8];
+
+    dtostrf(accelX, 8, 4, tx_string);
+    (characteristicAccel.X)->setValue(tx_string);
+
+    dtostrf(accelY, 8, 4, tx_string);
+    (characteristicAccel.Y)->setValue(tx_string);
+
+    dtostrf(accelZ, 8, 4, tx_string);
+    (characteristicAccel.Z)->setValue(tx_string);
+
+    dtostrf(gyroX, 8, 4, tx_string);
+    (characteristicGyro.X)->setValue(tx_string);
+
+    dtostrf(gyroY, 8, 4, tx_string);
+    (characteristicGyro.Y)->setValue(tx_string);
+
+    dtostrf(gyroZ, 8, 4, tx_string);
+    (characteristicGyro.Z)->setValue(tx_string);
+
+    characteristicAccel.X->notify();
+    characteristicAccel.Y->notify();
+    characteristicAccel.Z->notify();
+
+    characteristicGyro.X->notify();
+    characteristicGyro.Y->notify();
+    characteristicGyro.Z->notify();
   }
 
-  // After authentication, send MPU-6050 data every second
-  if (isAuthenticated) {
-    float accX, accY, accZ;
-    float gyroX, gyroY, gyroZ;
-    getMPUData(accX, accY, accZ, gyroX, gyroY, gyroZ);
-
-    // Send the MPU data to the Flutter app
-    String dataMessage = "ACC: X=" + String(accX) + 
-                         " Y=" + String(accY) + 
-                         " Z=" + String(accZ) +
-                         " | GYRO: X=" + String(gyroX) + 
-                         " Y=" + String(gyroY) + 
-                         " Z=" + String(gyroZ);
-
-    SerialBT.println(dataMessage); // Send data over Bluetooth
-    Serial.println(dataMessage);   // Print to serial monitor
-    
-    // Blink Blue LED to indicate data transmission
-    digitalWrite(blueLED, HIGH);
-    delay(100);
-    digitalWrite(blueLED, LOW);
-
-    delay(1000); // Wait for 1 second before sending the next reading
+  if (mpu_connected) {
+    // Serial.printf("Simulated Acceleration X: %f   Y: %f   Z: %f \n", accelX, accelY, accelZ);
+    // Serial.printf("Simulated Gyro         X: %f   Y: %f   Z: %f \n", gyroX, gyroY, gyroZ);
   }
+
+  delay(500);
 }
